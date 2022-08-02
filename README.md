@@ -7,7 +7,7 @@ __[SpanBERT: Improving Pre-training by Representing and Predicting Spans](https:
 This implementation contains additional scripts and configurations I used in the context of my master's thesis. That 
 includes the use of other pre-trained language models, training the model on various German datasets and improving its
 performance for low resource languages leveraging transfer learning. For the vanilla versions of the fundamental 
-coreference resolution models see the [Repository Overview](#Repository Overview).
+coreference resolution models see the [Repository Overview](#repository-overview).
 
 This implementation is based upon the [original implementation](https://github.com/mandarjoshi90/coref) by the papers 
 authors. The __model__ and _misc__ packages are written from scratch, whereas some scripts in the __setup__ package and 
