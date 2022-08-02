@@ -10,9 +10,9 @@ from model.modules import Scorer, init_weights, truncate_normal
 
 class Model(nn.Module):
 
-    def __init__(self, config, device1, device2, checkpointing=False):
+    def __init__(self, config, device1, device2, checkpointing=False, path=None):
         super().__init__()
-        self.bert_model = ModelBert(config, device1, checkpointing)
+        self.bert_model = ModelBert(config, device1, checkpointing, path)
         self.task_model = ModelTask(config, device2, checkpointing)
 
     def forward(self, sents, *args):
@@ -20,9 +20,25 @@ class Model(nn.Module):
         return self.task_model(bert_embs, *args)
 
 
+class ModelDiscriminator(nn.Module):
+
+    def __init__(self, config, bert_model):
+        super().__init__()
+        self.bert_model = bert_model
+        bert_size = config['bert_emb_size']
+        self.discriminator = nn.Linear(bert_size, 1)
+
+    def forward(self, sents):
+        bert_emb = self.bert_model(sents)
+        # https://arxiv.org/abs/1909.00153
+        mean_emb = bert_emb.mean(dim=0)
+        out_lang = self.discriminator(mean_emb)
+        return F.sigmoid(out_lang)
+
+
 class ModelBert(nn.Module):
 
-    def __init__(self, config, device, checkpointing=False):
+    def __init__(self, config, device, checkpointing=False, path=None):
         super().__init__()
         self.device = device
         # bert embedding
@@ -30,7 +46,8 @@ class ModelBert(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
         bert_config = AutoConfig.from_pretrained(model_id)
         bert_config.gradient_checkpointing = checkpointing
-        self.model = AutoModel.from_pretrained(model_id, config=bert_config)
+        source = path if path else model_id
+        self.model = AutoModel.from_pretrained(source, config=bert_config)
 
     def forward(self, sents):
         # calculate bert embeddings

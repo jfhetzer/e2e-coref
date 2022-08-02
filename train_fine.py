@@ -24,11 +24,11 @@ class Trainer:
         self.dataloader = DataLoader(self.dataset, shuffle=True)
         self.evaluator = Evaluator(conf)
 
-    def train(self, name, amp=False, checkpointing=False, dump_path=None):
+    def train(self, name, lr_bert, lr_task, epochs, amp=False, checkpointing=False, dump_path=None):
         # Print infos to console
         print(f'### Start Training ###')
         print(f'running on: {self.device1} {self.device2}')
-        print(f'running for: {self.config["epochs"]} epochs')
+        print(f'running for: {epochs} epochs')
         print(f'number of batches: {len(self.dataloader)}')
         print(f'saving ckpts to: {name}\n')
 
@@ -41,9 +41,6 @@ class Trainer:
         model.task_model.to(self.device2)
         model.train()
 
-        # define loss and optimizer
-        lr_bert, lr_task = self.config['lr_bert'], self.config['lr_task'],
-
         # exclude bias and layer-norm from weight decay
         bert_params_wd = []
         bert_params_no_wd = []
@@ -52,7 +49,7 @@ class Trainer:
             group.append(param)
 
         # bert fine-tuning
-        train_steps = len(self.dataloader) * self.config["epochs"]
+        train_steps = len(self.dataloader) * epochs
         warmup_steps = int(train_steps * 0.1)
         optimizer_bert = AdamW([{'params': bert_params_wd, 'weight_decay': 0.01},
                                 {'params': bert_params_no_wd, 'weight_decay': 0.0}], lr=lr_bert, correct_bias=False)
@@ -69,10 +66,10 @@ class Trainer:
         self.path = Path(f'./data/ckpt/{name}')
         self.path.mkdir(exist_ok=True)
         # load latest checkpoint from path
-        epoch = self.load_ckpt(model, optimizer_bert, optimizer_task, scheduler_bert, scheduler_task, scaler)
+        self.load_ckpt(model)
 
         # run indefinitely until keyboard interrupt
-        for e in range(epoch, self.config['epochs']):
+        for e in range(epochs):
             init_epoch_time = time.time()
             for i, batch in enumerate(self.dataloader):
                 optimizer_bert.zero_grad()
@@ -98,51 +95,29 @@ class Trainer:
                     print(f'Batch {i+1:04d} of {len(self.dataloader)}')
 
             if dump_path:
-                self.eval(model, e, dump_path, amp)
+                self.eval(model, name, e, lr_bert, lr_task, dump_path, amp)
             else:
-                self.save_ckpt(e, model, optimizer_bert, optimizer_task, scheduler_bert, scheduler_task, scaler)
+                self.save_ckpt(e, model)
             epoch_time = time.time() - init_epoch_time
             epoch_time = time.strftime('%H:%M:%S', time.gmtime(epoch_time))
             print(f'Epoch {e:03d} took: {epoch_time}\n')
 
-    def eval(self, model, epoch, dump_path, amp):
+    def eval(self, model, name, epoch, lr_bert, lr_task, dump_path, amp):
         model.eval()
-        dump_path = Path(dump_path) / f'ckpt_{epoch:02d}.pickle'
-        print(f'##### EVAL EPOCH {epoch} #####')
+        dump_path = Path(dump_path) / f'{name}_{lr_bert}_{lr_task}_{epoch:02d}.pickle'
+        print(f'##### EVAL {name} | {lr_bert} | {lr_task} | {epoch:02d} #####')
         self.evaluator.eval_model(model, dump_path, amp)
         model.train()
 
-    def save_ckpt(self, epoch, model, optimizer_bert, optimizer_task, scheduler_bert, scheduler_task, scaler):
+    def save_ckpt(self, epoch, model):
+        # this snapshot is not ment to resume fine-tuning but only for evaluation
         path = self.path.joinpath(f'ckpt_epoch-{epoch:03d}.pt.tar')
-        torch.save({
-            'epoch': epoch,
-            'model': model.state_dict(),
-            'optimizer_bert': optimizer_bert.state_dict(),
-            'optimizer_task': optimizer_task.state_dict(),
-            'scheduler_bert': scheduler_bert.state_dict(),
-            'scheduler_task': scheduler_task.state_dict(),
-            'scaler': scaler.state_dict()
-        }, path)
+        torch.save({'model': model.state_dict()}, path)
 
-    def load_ckpt(self, model, optimizer_bert, optimizer_task, scheduler_bert, scheduler_task, scaler):
-        # check if any checkpoint accessible
+    def load_ckpt(self, model):
         ckpts = list(self.path.glob('ckpt_epoch-*.pt.tar'))
-        if not ckpts:
-            print(f'\nNo checkpoint found: Start training from scratch\n')
-            return 0
-
-        # get latest checkpoint
         latest_ckpt = max(ckpts, key=lambda p: p.stat().st_ctime)
-        print(f'\nCheckpoint found: Load {latest_ckpt}\n')
-        # load latest checkpoint and return next epoch
-        latest_ckpt = torch.load(latest_ckpt)
-        model.load_state_dict(latest_ckpt['model'])
-        optimizer_bert.load_state_dict(latest_ckpt['optimizer_bert'])
-        optimizer_task.load_state_dict(latest_ckpt['optimizer_task'])
-        scheduler_bert.load_state_dict(latest_ckpt['scheduler_bert'])
-        scheduler_task.load_state_dict(latest_ckpt['scheduler_task'])
-        scaler.load_state_dict(latest_ckpt['scaler'])
-        return latest_ckpt['epoch'] + 1
+        model.load_state_dict(torch.load(latest_ckpt)['model'])
 
     @staticmethod
     def compute_loss(scores, labels):
@@ -165,10 +140,13 @@ if __name__ == '__main__':
     parser.add_argument('-c', metavar='CONF', default='bert-base', help='configuration (see coref.conf)')
     parser.add_argument('-f', metavar='FOLDER', default=folder, help='snapshot folder (data/ckpt/<FOLDER>)')
     parser.add_argument('-d', metavar='DUMP', default=None, help='folder to dump predictions into')
+    parser.add_argument('-eps', metavar='EPOCHS', type=int, default=10, help='number of epochs')
+    parser.add_argument('-lr_b', metavar='LR_BERT', type=float, default=0.0001, help='number of GPUs to which the model is distributed')
+    parser.add_argument('-lr_t', metavar='LR_TASK', type=float, default=0.0001, help='number of GPUs to which the model is distributed')
     parser.add_argument('--cpu', action='store_true', help='train on CPU even when GPU is available')
     parser.add_argument('--amp', action='store_true', help='use amp optimization')
     parser.add_argument('--check', action='store_true', help='use gradient checkpointing')
     parser.add_argument('--split', action='store_true', help='split the model across two GPUs')
     args = parser.parse_args()
     # run training
-    Trainer(args.c, not args.cpu, args.split).train(args.f, args.amp, args.check, args.d)
+    Trainer(args.c, not args.cpu, args.split).train(args.f, args.lr_b, args.lr_t, args.eps, args.amp, args.check, args.d)
