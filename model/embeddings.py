@@ -9,6 +9,7 @@ class WordEmbedder:
     def __init__(self, dim, path):
         self.embeddings = self.load_embedding(dim, path)
         self.size = len(self.embeddings)
+        self.dim = dim
 
     def __len__(self):
         return self.size

@@ -16,8 +16,8 @@ class Evaluator:
         self.config = ConfigFactory.parse_file('./coref.conf')[conf]
 
         # load dataset with test data
-        path = self.config['eval_data_path']
-        self.dataset = Dataset(self.config, path, training=False)
+        path, elmo_path = self.config['eval_data_path'], self.config['eval_elmo_path']
+        self.dataset = Dataset(self.config, path, elmo_path, training=False)
         self.dataloader = DataLoader(self.dataset, shuffle=False)
 
         # initialize model and move to gpu if available
@@ -49,7 +49,7 @@ class Evaluator:
             for i, batch in enumerate(self.dataloader):
                 # collect data for evaluating batch
                 with torch.cuda.amp.autocast(enabled=amp):
-                    _, _, sent_len, _, _, gold_starts, gold_ends, _, cand_starts, cand_ends = batch
+                    _, _, _, _, sent_len, _, _, gold_starts, gold_ends, _, cand_starts, cand_ends = batch
                     scores, labels, antes, ment_starts, ment_ends, cand_scores = self.model(*batch)
 
                 # update mention evaluators

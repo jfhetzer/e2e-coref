@@ -2,6 +2,44 @@ import torch
 from torch import nn
 
 
+class ElmoAggregator(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+        self.weights = nn.Parameter(torch.zeros(3))
+        self.scale = nn.Parameter(torch.tensor(1.))
+
+    def forward(self, input):
+        output = input @ torch.softmax(self.weights, dim=-1)
+        return output * self.scale
+
+
+class HighwayLSTM(nn.Module):
+
+    def __init__(self, input_size, hidden_size, dropout):
+        super().__init__()
+        self.dropout = dropout
+        self.lstms = nn.ModuleList([
+            CustomLSTM(input_size, hidden_size, dropout),
+            CustomLSTM(2*hidden_size, hidden_size, dropout),
+            CustomLSTM(2*hidden_size, hidden_size, dropout)
+        ])
+        self.highway_gates = nn.ModuleList([
+            nn.Linear(2*hidden_size, 2*hidden_size),
+            nn.Linear(2*hidden_size, 2*hidden_size)
+        ])
+
+    def forward(self, input, sent_len):
+        for i in range(len(self.lstms)):
+            output = self.lstms[i](input, sent_len)
+            output = torch.dropout(output, self.dropout, self.training)
+            if i > 0:
+                g = torch.sigmoid(self.highway_gates[i - 1](output))
+                output = g * output + (1 - g) * input
+            input = output
+        return output
+
+
 class CustomLSTM(nn.Module):
 
     def __init__(self, input_size, hidden_size, dropout):
@@ -31,10 +69,8 @@ class CustomLSTMCell(nn.Module):
         # (default initialization for tensorflow's get_variable)
         self.init_hidden_state = nn.Parameter(nn.init.xavier_uniform_(torch.empty(1, hidden_size)))
         self.init_cell_state = nn.Parameter(nn.init.xavier_uniform_(torch.empty(1, hidden_size)))
-        # separate layers for input and hidden state (cf. original implementation)
         # forget and input gate are combined -> 3 gates left
-        self.input_layer = nn.Linear(input_size, 3 * hidden_size)
-        self.hidden_layer = nn.Linear(hidden_size, 3 * hidden_size)
+        self.hidden_layer = nn.Linear(input_size + hidden_size, 3 * hidden_size)
         # initialize hidden state layer with random orthonormal matrix
         nn.init.orthogonal_(self.hidden_layer.weight)
 
@@ -51,9 +87,8 @@ class CustomLSTMCell(nn.Module):
         for t in range(seq_len):
             hidden_state *= dropout_mask
             input_t = input[:, t, :]
-            input_out = self.input_layer(input_t)
-            hidden_out = self.hidden_layer(hidden_state)
-            i, j, o = torch.split(input_out + hidden_out, self.hidden_size, dim=1)
+            concat = self.hidden_layer(torch.cat((input_t, hidden_state), dim=1))
+            i, j, o = torch.split(concat, self.hidden_size, dim=1)
             i = torch.sigmoid(i)
             cell_state = (1-i) * cell_state + i * torch.tanh(j)
             hidden_state = torch.tanh(cell_state) * torch.sigmoid(o)

@@ -45,8 +45,7 @@ python setup/minimize.py
 mkdir -p data/embs
 cd data/embs
 
-# download and unzip embeddings
-curl -O https://lil.cs.washington.edu/coref/turian.50d.txt
+# download and unzip context glove embeddings
 curl -O http://downloads.cs.stanford.edu/nlp/data/glove.840B.300d.zip
 unzip glove.840B.300d.zip
 rm glove.840B.300d.zip
@@ -54,6 +53,7 @@ rm glove.840B.300d.zip
 # create vocab and filter embedding for training
 python ../../setup/get_char_vocab.py
 python ../../setup/filter_embeddings.py glove.840B.300d.txt ../data/train.english.jsonlines ../data/dev.english.jsonlines ../data/test.english.jsonlines
+python ../../setup/filter_embeddings.py glove_50_300_2.txt ../data/train.english.jsonlines ../data/dev.english.jsonlines ../data/test.english.jsonlines
 
 
 ######################################## CHECKPOINTS #########################################

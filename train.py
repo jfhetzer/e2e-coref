@@ -16,8 +16,8 @@ class Trainer:
         use_cuda = gpu and torch.cuda.is_available()
         self.device = torch.device('cuda' if use_cuda else 'cpu')
         # load dataset with training data
-        path = self.config['train_data_path']
-        self.dataset = Dataset(self.config, path, training=True)
+        path, elmo_path = self.config['train_data_path'], self.config['train_elmo_path']
+        self.dataset = Dataset(self.config, path, elmo_path, training=True)
         self.dataloader = DataLoader(self.dataset, shuffle=True)
 
     def train(self, name, amp=False):
