@@ -1,0 +1,15 @@
+# ignore python / pycharm files
+**/__pycache__/
+*.pyc
+.idea
+
+# ignore checkpoints
+data/ckpt
+
+# ignore data downloaded and build up by setup.sh
+conll-2012
+data/data
+data/embs
+
+# ignore local files
+local
