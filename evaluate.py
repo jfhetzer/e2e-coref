@@ -11,20 +11,25 @@ from model.model import Model
 
 class Evaluator:
 
-    def __init__(self, conf, gpu):
+    def __init__(self, conf, gpu, split):
         # load configuration
         self.config = ConfigFactory.parse_file('./coref.conf')[conf]
 
         # load dataset with test data
-        path, elmo_path = self.config['eval_data_path'], self.config['eval_elmo_path']
-        self.dataset = Dataset(self.config, path, elmo_path, training=False)
+        self.dataset = Dataset(self.config, training=False)
         self.dataloader = DataLoader(self.dataset, shuffle=False)
 
         # initialize model and move to gpu if available
         use_cuda = gpu and torch.cuda.is_available()
-        device = torch.device('cuda' if use_cuda else 'cpu')
-        self.model = Model(self.config, device)
-        self.model.to(device)
+        device1 = torch.device('cuda:0' if use_cuda else 'cpu')
+        device2 = torch.device('cuda:1' if use_cuda else 'cpu')
+        device2 = device2 if split else device1
+        print(f'Running on: {device1} {device2}')
+
+        # initialize model and move to gpu if available
+        self.model = Model(self.config, device1, device2)
+        self.model.bert_model.to(device1)
+        self.model.task_model.to(device2)
         self.model.eval()
 
     def eval(self, ckpt_path, amp):
@@ -42,32 +47,33 @@ class Evaluator:
         ment_evaluators.extend([evaluators.RelativeEvaluator(f'{i}%', i) for i in [10, 15, 20, 25, 30, 40, 50]])
 
         # initialize coref evaluator
-        coref_preds = {}
+        coref_preds, subtoken_map = {}, {}
         coref_evaluator = metrics.CorefEvaluator()
 
         with torch.no_grad():
             for i, batch in enumerate(self.dataloader):
                 # collect data for evaluating batch
                 with torch.cuda.amp.autocast(enabled=amp):
-                    _, _, _, _, sent_len, _, _, gold_starts, gold_ends, _, cand_starts, cand_ends = batch
+                    _, segm_len, _, _, gold_starts, gold_ends, _, cand_starts, cand_ends = batch
                     scores, labels, antes, ment_starts, ment_ends, cand_scores = self.model(*batch)
 
                 # update mention evaluators
                 for ment_evaluator in ment_evaluators:
                     ment_evaluator.update(cand_starts, cand_ends, gold_starts, gold_ends, ment_starts, ment_ends,
-                                          cand_scores, sent_len)
+                                          cand_scores, segm_len)
 
                 # update coref evaluators
                 raw_data = self.dataset.get_raw_data(i)
                 pred_clusters = self.eval_antecedents(scores, antes, ment_starts, ment_ends, raw_data, coref_evaluator)
                 coref_preds[raw_data['doc_key']] = pred_clusters
+                subtoken_map[raw_data['doc_key']] = raw_data['token_map']
 
         # print F1, precision and recall of all mention evaluators
         for ment_evaluator in ment_evaluators:
             ment_evaluator.print_result()
 
         # print average F1 of CoNLL scorer
-        conll_results = conll.evaluate_conll(self.config['eval_gold_path'], coref_preds, True)
+        conll_results = conll.evaluate_conll(self.config['eval_gold_path'], coref_preds, subtoken_map, True)
         conll_f1 = np.mean([result['f'] for result in conll_results.values()])
         print(f'Average F1 (conll): {conll_f1:.2f}%')
 
@@ -127,10 +133,11 @@ class Evaluator:
 if __name__ == '__main__':
     # parse command line arguments
     parser = argparse.ArgumentParser(description='Evaluate multiple model checkpoints.')
-    parser.add_argument('-c', metavar='CONF', default='base', help='configuration (see coref.conf)')
+    parser.add_argument('-c', metavar='CONF', default='bert-base', help='configuration (see coref.conf)')
     parser.add_argument('-p', metavar='PATTERN', default='*.pt', help='pattern for checkpoints (data/ckpt/<PATTERN>)')
     parser.add_argument('--cpu', action='store_true', help='train on CPU even when GPU is available')
     parser.add_argument('--amp', action='store_true', help='use amp optimization')
+    parser.add_argument('--split', action='store_true', help='split the model across two GPUs')
     args = parser.parse_args()
 
     # get path and search for ckpts
@@ -140,7 +147,7 @@ if __name__ == '__main__':
     print('\n'.join([str(ckpt) for ckpt in ckpts]) + '\n')
 
     # run evaluation
-    evaluator = Evaluator(args.c, not args.cpu)
+    evaluator = Evaluator(args.c, not args.cpu, args.split)
     for ckpt in ckpts:
         print(f'\n########## {ckpt} ##########\n')
         evaluator.eval(ckpt, args.amp)

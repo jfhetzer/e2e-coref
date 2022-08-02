@@ -2,52 +2,94 @@ import math
 import torch
 import torch.nn as nn
 from torch.functional import F
+from torch.utils.checkpoint import checkpoint
+from transformers import AutoConfig, AutoModel, AutoTokenizer
 
-from model.modules import HighwayLSTM, Scorer, ElmoAggregator
-from model.embeddings import CharCnnEmbedder
+from model.modules import Scorer, init_weights, truncate_normal
 
 
 class Model(nn.Module):
 
-    def __init__(self, config, device):
+    def __init__(self, config, device1, device2, checkpointing=False):
+        super().__init__()
+        self.bert_model = ModelBert(config, device1, checkpointing)
+        self.task_model = ModelTask(config, device2, checkpointing)
+
+    def forward(self, sents, *args):
+        bert_embs = self.bert_model(sents)
+        return self.task_model(bert_embs, *args)
+
+
+class ModelBert(nn.Module):
+
+    def __init__(self, config, device, checkpointing=False):
+        super().__init__()
+        self.device = device
+        # bert embedding
+        model_id = config['bert']
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        bert_config = AutoConfig.from_pretrained(model_id)
+        bert_config.gradient_checkpointing = checkpointing
+        self.model = AutoModel.from_pretrained(model_id, config=bert_config)
+
+    def forward(self, sents):
+        # calculate bert embeddings
+        embs = []
+        for sent in sents:
+            tokens_idx = self.tokenizer.convert_tokens_to_ids(sent)
+            tokens_tensor = torch.tensor([tokens_idx], device=self.device)
+            enc_layers = self.model(tokens_tensor)[0]
+            embs.append(enc_layers.squeeze())
+        return torch.cat(embs, dim=0)
+
+
+class ModelTask(nn.Module):
+
+    def __init__(self, config, device, checkpointing=False):
         super().__init__()
         self.config = config
         self.device = device
+        self.condCheckpoint = checkpoint if checkpointing else lambda f, *i: f(*i)
         self.dropout = self.config['dropout']
         self.max_width = self.config['max_ment_width']
 
-        # word/document embedding
-        self.char_emb = CharCnnEmbedder(self.config)
-        self.aggregator = ElmoAggregator()
-        word_emb_size = self.config['word_emb']
-        lstm_hidden_size = self.config['lstm_hidden_size']
-        lstm_dropout = self.config['lstm_dropout']
-        self.lstm = HighwayLSTM(word_emb_size, lstm_hidden_size, dropout=lstm_dropout)
-
         # mention embedding
-        self.span_head = nn.Linear(2 * lstm_hidden_size, 1)
+        bert_size = self.config['bert_emb_size']
+        self.span_head = nn.Linear(bert_size, 1)
 
         # feature embeddings
         bin_width = self.config['bin_widths']
         feature_size = self.config['feature_size']
         genre_num = len(self.config['genres'])
-        self.speaker_embds = nn.Embedding(2, feature_size)
-        self.genre_embeds = nn.Embedding(genre_num, feature_size)
-        self.ant_dist_embeds = nn.Embedding(len(bin_width), feature_size)
-        self.mention_width_embeds = nn.Embedding(self.max_width, feature_size)
+        self.speaker_emb = nn.Embedding(2, feature_size)
+        self.genre_emb = nn.Embedding(genre_num, feature_size)
+        self.ante_dist_emb = nn.Embedding(len(bin_width), feature_size)
+        self.ment_width_emb = nn.Embedding(self.max_width, feature_size)
 
         # scorer for mentions and antecedents
-        hidden_size, head_size = self.config['hidden_size'], self.config['head_size']
-        char_emb_size = len(self.config['kernel_size']) * self.config['kernel_num']
-        ment_emb_size = 4 * lstm_hidden_size + feature_size + head_size + char_emb_size
-        ante_emb_size = 3 * ment_emb_size + 3 * feature_size
-        self.mention_scorer = Scorer(input_size=ment_emb_size, hidden_size=hidden_size, dropout=self.dropout)
-        self.slow_antecedent_scorer = Scorer(input_size=ante_emb_size, hidden_size=hidden_size, dropout=self.dropout)
+        hidden_size = self.config['hidden_size']
+        hidden_depth = self.config['hidden_depth']
+        ment_emb_size = 3 * bert_size + feature_size
+        ante_emb_size = 3 * ment_emb_size + 4 * feature_size
+        # mention scoring
+        self.mention_scorer = Scorer(ment_emb_size, hidden_size, hidden_depth, self.dropout)
+        self.ment_width_scorer = Scorer(feature_size, hidden_size, hidden_depth, self.dropout)
+        self.ment_width_scorer_emb = nn.Parameter(truncate_normal((self.max_width, feature_size)))
+        # fast antecedent scoring
         self.fast_antecedent_scorer = nn.Linear(ment_emb_size, ment_emb_size)
+        self.ante_dist_scorer = Scorer(feature_size, hidden_depth=0)
+        self.ante_dist_scorer_emb = nn.Parameter(truncate_normal((len(bin_width), feature_size)))
+        # slow antecedent scoring
+        self.slow_antecedent_scorer = Scorer(ante_emb_size, hidden_size, hidden_depth, self.dropout)
+        self.seg_dist_emb = nn.Embedding(self.config['max_segm_num'], feature_size)
         self.attended_gate = nn.Sequential(
             nn.Linear(2 * ment_emb_size, ment_emb_size),
             nn.Sigmoid()
         )
+
+        # initialize weights
+        with torch.no_grad():
+            self.apply(init_weights)
 
         # bins for antecedent distance embedding
         # [0, 1, 2, 3, 4, 5-7, 8-15, 16-31, 32-63, 64+]
@@ -56,37 +98,36 @@ class Model(nn.Module):
             self.bins.extend([i] * w)
         self.bins = torch.as_tensor(self.bins, dtype=torch.long, device=self.device)
 
-    def ment_embedding(self, head_doc_embs, flat_lstm_out, ment_start, ment_ends):
+    def ment_embedding(self, bert_emb, ment_starts, ment_ends):
         # get representation for start and end of mention
-        start_embs = flat_lstm_out[ment_start]
-        end_embs = flat_lstm_out[ment_ends]
+        start_embs = bert_emb[ment_starts]
+        end_embs = bert_emb[ment_ends]
+
+        # calculate distance between mentions
+        ment_dist = ment_ends - ment_starts
 
         # get mention width embedding
-        width = ment_ends - ment_start + 1
-        width_size, = width.shape
-        width_embs = self.mention_width_embeds(width - 1)
+        width = ment_ends - ment_starts + 1
+        width_embs = self.ment_width_emb(width - 1)
         width_embs = torch.dropout(width_embs, self.dropout, self.training)
 
         # get head representation
-        doc_len = len(head_doc_embs)
-        span_idxs = torch.clamp(
-            torch.arange(self.max_width, device=self.device).view(1, -1) + ment_start.view(-1, 1), max=doc_len - 1)
-        ment_doc_embs = head_doc_embs[span_idxs]
-        # max mention width 10
-        span_head_emb = self.span_head(flat_lstm_out)
-        span_head_emb = torch.squeeze(span_head_emb)
-        span_head_emb = span_head_emb[span_idxs]
-        # create mask for different mention widths
-        ment_mask = torch.arange(self.max_width, device=self.device).view(1, -1).repeat(width_size, 1) < width.view(-1, 1)
+        doc_len, ment_num = len(bert_emb), len(ment_starts)
         # transform mask 0 -> -inf / 1 -> 0 for softmax and add to embeddings
-        span_head_emb += torch.log(ment_mask.float())
-        attention = F.softmax(span_head_emb, dim=1).view(-1, self.max_width, 1)
+        doc_range = torch.arange(doc_len, device=self.device).expand(ment_num, -1)
+        ment_mask = (ment_starts.view(-1, 1) <= doc_range) * (doc_range <= ment_ends.view(-1, 1))
+        # calculate attention for word per mention
+        word_attn = self.span_head(bert_emb).view(1, -1)
+        # type depends on amp level (float or half)
+        ment_mask = ment_mask.type(word_attn.dtype)
+        ment_word_attn = word_attn + torch.log(ment_mask)
+        ment_word_attn = F.softmax(ment_word_attn, dim=1)
         # calculate final head embedding as weighted sum
-        head_embs = (attention * ment_doc_embs).sum(dim=1)
+        head_embs = torch.matmul(ment_word_attn, bert_emb)
 
         # combine different embeddings to single mention embedding
         # warning: different order than proposed in the paper
-        return torch.cat((start_embs, end_embs, width_embs, head_embs), dim=1)
+        return torch.cat((start_embs, end_embs, width_embs, head_embs), dim=1), ment_dist
 
     def prune_mentions(self, ment_starts, ment_ends, ment_scores, k):
         # get mention indices sorted by the mention score
@@ -141,6 +182,12 @@ class Model(nn.Module):
         fast_ante_scores += ment_scores.view(-1, 1) + ment_scores.view(1, -1)
         fast_ante_scores += torch.log(ante_mask.float())
 
+        # add antecedents distance score (bert-coref)
+        ante_dist_bin = self.bins[torch.clamp(ante_offset, min=0, max=64)]
+        ante_dist_emb = torch.dropout(self.ante_dist_scorer_emb, self.dropout, self.training)
+        ante_dist_score = self.ante_dist_scorer(ante_dist_emb)[ante_dist_bin]
+        fast_ante_scores += ante_dist_score.squeeze()
+
         # get top antes and prune
         _, top_antes = torch.topk(fast_ante_scores, c, sorted=True)
         # top_antes = np.load('antes.npy')
@@ -149,26 +196,29 @@ class Model(nn.Module):
         top_ante_offset = ante_offset[ment_range.view(-1, 1), top_antes]
         return top_antes, top_ante_mask, top_fast_ante_scores, top_ante_offset
 
-    def antecedent_embedding(self, ment_emb, antecendets, genre_id, ment_speakers):
+    def antecedent_embedding(self, ment_emb, antecendets, genre_id, ment_speakers, seg_dist):
         # build up input of shape [num_ment, max_ante, emb]
         num_ment, max_ante = antecendets.shape
 
         # genre embedding
-        genre_emb = self.genre_embeds(genre_id)
+        genre_emb = self.genre_emb(genre_id)
         genre_emb = genre_emb.view(1, 1, -1).repeat(num_ment, max_ante, 1)
 
         # same speaker embedding
         ante_speakers = ment_speakers[antecendets]
         same_speaker = torch.eq(ment_speakers.view(-1, 1), ante_speakers)
-        speaker_emb = self.speaker_embds(same_speaker.long())
+        speaker_emb = self.speaker_emb(same_speaker.long())
 
         # antecedent distance embedding
         ante_dist = torch.arange(num_ment, device=self.device).view(-1, 1) - antecendets
         ante_dist_bin = self.bins[torch.clamp(ante_dist, min=0, max=64)]
-        ante_dist_emb = self.ant_dist_embeds(ante_dist_bin)
+        ante_dist_emb = self.ante_dist_emb(ante_dist_bin)
+
+        # segment distance embedding
+        seg_dist_emb = self.seg_dist_emb(seg_dist)
 
         # apply dropout to feature embeddings
-        feature_emb = torch.cat((speaker_emb, genre_emb, ante_dist_emb), dim=2)
+        feature_emb = torch.cat((speaker_emb, genre_emb, ante_dist_emb, seg_dist_emb), dim=2)
         feature_emb = torch.dropout(feature_emb, self.dropout, self.training)
 
         # antecedent embedding / mention embedding / similarity
@@ -200,59 +250,70 @@ class Model(nn.Module):
         dummy_labels = ~labels.any(dim=1, keepdim=True)
         return torch.cat((dummy_labels, labels), dim=1)
 
-    def forward(self, cont_emb, head_emb, elmo_emb, char_index, sent_len, genre_id, speaker_ids, gold_starts, gold_ends, cluster_ids, cand_starts, cand_ends):
-        # create sentence mask to flatten tensors
-        sent_num, max_sent_len, _ = cont_emb.shape
-        sent_mask = torch.arange(max_sent_len).view(1, -1).repeat(sent_num, 1) < torch.as_tensor(sent_len).view(-1, 1)
-
-        # cnn char embedder
-        char_emb = self.char_emb(char_index.to(self.device))
-
-        # get elmo embedding
-        elmo_agg = self.aggregator(elmo_emb.to(self.device))
-
-        # concat embeddings
-        cont_doc_emb = torch.cat((cont_emb.to(self.device), char_emb, elmo_agg), dim=2)
-        head_doc_emb = torch.cat((head_emb.to(self.device), char_emb), dim=2)
-        cont_doc_emb = torch.dropout(cont_doc_emb, self.config['dropout_lexical'], self.training)
-        head_doc_emb = torch.dropout(head_doc_emb, self.config['dropout_lexical'], self.training)
-
-        lstm_out = self.lstm(cont_doc_emb, sent_len)
-        output = lstm_out[sent_mask]
-
-        head_doc_embs = head_doc_emb[sent_mask]
-        cand_embs = self.ment_embedding(head_doc_embs, output, cand_starts.to(self.device), cand_ends.to(self.device))
-        # get mention scores and prune to get top scores
+    def forward_fast(self, bert_emb, speaker_ids, cand_starts, cand_ends):
+        # get candidate mentions and scores
+        cand_embs, cand_dist = self.ment_embedding(bert_emb, cand_starts.to(self.device), cand_ends.to(self.device))
         cand_scores = self.mention_scorer(cand_embs).squeeze()
-        k = math.floor(output.shape[0] * self.config['ment_ratio'])
-        top_ment_idx = self.prune_mentions(cand_starts, cand_ends, cand_scores, k)
+        # combine old mention scores and width score (bert-coref)
+        width_scores = self.ment_width_scorer(self.ment_width_scorer_emb)
+        cand_scores += width_scores[cand_dist].squeeze()
+
+        # prune to get top scoring candidate mentions
+        self.k = math.floor(bert_emb.shape[0] * self.config['ment_ratio'])
+        top_ment_idx = self.prune_mentions(cand_starts, cand_ends, cand_scores, self.k)
+        # assure that k is the actual number of pruned mentions
+        # can be lower than the initial k, due to subtokens and crossing mentions
+        self.k = len(top_ment_idx)
+
         # filter mention candidates for top scoring mentions
-        ment_starts = cand_starts[top_ment_idx]
-        ment_ends = cand_ends[top_ment_idx]
+        self.ment_starts = cand_starts[top_ment_idx]
+        self.ment_ends = cand_ends[top_ment_idx]
         ment_embs = cand_embs[top_ment_idx]
         ment_scores = cand_scores[top_ment_idx]
-        ment_speakers = speaker_ids[ment_starts]
+        self.ment_speakers = speaker_ids[self.ment_starts]
 
         # get top c antecedents per mention by fast scoring
-        c = min(self.config['max_antes'], k)
-        antes, ante_mask, fast_scores, ante_offset = self.get_fast_antecedents(ment_embs, ment_scores, c)
+        c = min(self.config['max_antes'], self.k)
+        self.antes, self.ante_mask, fast_scores, ante_offset = self.get_fast_antecedents(ment_embs, ment_scores, c)
+        return fast_scores, cand_scores, ment_embs
 
-        # iterative inference procedure
-        dummy_scores = torch.zeros(k, 1, device=self.device, dtype=fast_scores.dtype)
+    def forward_slow(self, fast_scores, ment_embs, seg_dist, dummy_scores, genre_id):
+        # get full scores for antecedents
+        ante_ment_emb = ment_embs[self.antes]
+        ante_emb = self.antecedent_embedding(ment_embs, self.antes, genre_id.to(self.device),
+                                             self.ment_speakers.to(self.device), seg_dist.to(self.device))
+        ante_scores = fast_scores + self.slow_antecedent_scorer(ante_emb).squeeze()
+        # refine mention representations
+        ante_weights = torch.softmax(torch.cat((dummy_scores, ante_scores), dim=1), dim=-1)
+        ante_emb = torch.cat((ment_embs.unsqueeze(1), ante_ment_emb), dim=1)
+        attended_emb = torch.sum(ante_weights.unsqueeze(-1) * ante_emb, dim=1)
+        f = self.attended_gate(torch.cat((ment_embs, attended_emb), dim=1))
+        ment_embs = f * attended_emb + (1 - f) * ment_embs
+        return ment_embs, ante_scores
+
+    def forward(self, bert_emb, segm_len, genre_id, speaker_ids, gold_starts, gold_ends, cluster_ids, cand_starts, cand_ends):
+        # create sentence mask to flatten tensors
+        sent_num, max_segm_len = len(segm_len), max(segm_len)
+        sent_mask = torch.arange(max_segm_len).view(1, -1).repeat(sent_num, 1) < torch.as_tensor(segm_len).view(-1, 1)
+
+        # compute fast scores until next checkpoint
+        inputs = (bert_emb, speaker_ids, cand_starts, cand_ends)
+        fast_scores, cand_scores, ment_embs = self.condCheckpoint(self.forward_fast, *inputs)
+
+        # compute distance between mention and antecedent on segment level (bert-coref)
+        seg_map = torch.arange(sent_num).view(-1, 1).repeat(1, max_segm_len)
+        flat_seg_map = seg_map[sent_mask].view(-1)
+        ment_seg, ante_seg = flat_seg_map[self.ment_starts], flat_seg_map[self.ment_starts[self.antes]]
+        seg_dist = torch.clamp(ment_seg.view(-1, 1) - ante_seg, min=0, max=self.config['max_segm_num'] - 1)
+
+        # iterative inference procedure / type depends on amp level (float or half)
+        dummy_scores = torch.zeros(self.k, 1, device=self.device, dtype=fast_scores.dtype)
         for i in range(self.config['coref_depth']):
-            # get full scores for antecedents
-            ante_ment_emb = ment_embs[antes]
-            ante_emb = self.antecedent_embedding(ment_embs, antes, genre_id.to(self.device), ment_speakers.to(self.device))
-            ante_scores = fast_scores + self.slow_antecedent_scorer(ante_emb).squeeze()
-            # refine mention representations
-            ante_weights = torch.softmax(torch.cat((dummy_scores, ante_scores), dim=1), dim=-1)
-            ante_emb = torch.cat((ment_embs.unsqueeze(1), ante_ment_emb), dim=1)
-            attended_emb = torch.sum(ante_weights.unsqueeze(-1) * ante_emb, dim=1)
-            f = self.attended_gate(torch.cat((ment_embs, attended_emb), dim=1))
-            ment_embs = f * attended_emb + (1 - f) * ment_embs
+            inputs = (fast_scores, ment_embs, seg_dist, dummy_scores, genre_id)
+            ment_embs, ante_scores = self.condCheckpoint(self.forward_slow, *inputs)
 
         # get final coreference score for antecedents and labels
         coref_score = torch.cat((dummy_scores, ante_scores), dim=1)
-        labels = self.get_labels(ment_starts, ment_ends, gold_starts, gold_ends, cluster_ids, antes, ante_mask)
+        labels = self.get_labels(self.ment_starts, self.ment_ends, gold_starts, gold_ends, cluster_ids, self.antes, self.ante_mask)
 
-        return coref_score, labels, antes, ment_starts, ment_ends, cand_scores
+        return coref_score, labels, self.antes, self.ment_starts, self.ment_ends, cand_scores

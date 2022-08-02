@@ -22,6 +22,7 @@ function compile_language() {
 ############################################ DATA ############################################
 mkdir -p data
 mkdir -p data/data
+mkdir -p data/embs
 
 # download and unzip conll data and scripts
 conll_url=http://conll.cemantix.org/2012/download
@@ -39,21 +40,6 @@ bash conll-2012/v3/scripts/skeleton2conll.sh -D $1/data/files/data conll-2012
 # move english data to data directory and remove needless information
 compile_language english
 python setup/minimize.py
-
-
-######################################### EMBEDDINGS #########################################
-mkdir -p data/embs
-cd data/embs
-
-# download and unzip context glove embeddings
-curl -O http://downloads.cs.stanford.edu/nlp/data/glove.840B.300d.zip
-unzip glove.840B.300d.zip
-rm glove.840B.300d.zip
-
-# create vocab and filter embedding for training
-python ../../setup/get_char_vocab.py
-python ../../setup/filter_embeddings.py glove.840B.300d.txt ../data/train.english.jsonlines ../data/dev.english.jsonlines ../data/test.english.jsonlines
-python ../../setup/filter_embeddings.py glove_50_300_2.txt ../data/train.english.jsonlines ../data/dev.english.jsonlines ../data/test.english.jsonlines
 
 
 ######################################## CHECKPOINTS #########################################

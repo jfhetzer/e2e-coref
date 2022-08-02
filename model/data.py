@@ -1,27 +1,28 @@
-import h5py
 import torch
 import json
 import random
 import itertools
+import numpy as np
+from pathlib import Path
 from torch.utils import data
-from model.embeddings import WordEmbedder, CharDictEmbedder
 
 
 class Dataset(data.Dataset):
 
-    def __init__(self, config, data_path, elmo_path, training=True):
+    def __init__(self, config, training=True):
         self.config = config
         self.training = training
+        # read from configuration
+        self.genres = {g: i for i, g in enumerate(self.config['genres'])}
+        data_folder = Path(config['data_folder'])
+        data_file = config['train_data_file'] if training else config['eval_data_file']
+        data_path = data_folder.joinpath(data_file)
+        # read data from file
         self.data = []
         with open(data_path, encoding='utf8') as file:
             for line in file:
                 self.data.append(json.loads(line))
         self.size = len(self.data)
-        self.genres = {g: i for i, g in enumerate(self.config['genres'])}
-        self.emb_cont = WordEmbedder(self.config['cont_size'], self.config['cont_emb'])
-        self.emb_head = WordEmbedder(self.config['head_size'], self.config['head_emb'])
-        self.emb_char = CharDictEmbedder(self.config['char_vocab'])
-        self.elmo_cache = h5py.File(elmo_path, 'r', swmr=True)
 
     def get_raw_data(self, item):
         return self.data[item]
@@ -33,35 +34,26 @@ class Dataset(data.Dataset):
         # get requested document
         doc, offset = self.data[item], 0
         # truncate in training if document is too long
-        max_sent_num = self.config['max_sent_num']
-        if self.training and len(doc['sentences']) > max_sent_num:
-            doc, offset = self.truncate(doc, max_sent_num)
+        max_segm_num = self.config['max_segm_num']
+        if self.training and len(doc['segments']) > max_segm_num:
+            doc, offset = self.truncate(doc, max_segm_num)
 
         # calculate some auxiliary variables
-        sents = doc['sentences']
-        sent_num = len(sents)
-        sent_len = [len(s) for s in sents]
-        word_len = [[len(w) for w in s] for s in sents]
-        max_sent_len = max(sent_len)
-        max_word_len = max(itertools.chain.from_iterable(word_len))
-
-        # apply embeddings and mappings on word and character level
-        cont_emb = torch.zeros(sent_num, max_sent_len, self.emb_cont.dim)
-        head_emb = torch.zeros(sent_num, max_sent_len, self.emb_head.dim)
-        char_index = torch.zeros(sent_num, max_sent_len, max_word_len, dtype=torch.long)
-        for i, sent in enumerate(sents):
-            for j, word in enumerate(sent):
-                cont_emb[i, j] = self.emb_cont[word]
-                head_emb[i, j] = self.emb_head[word]
-                char_index[i, j, :len(word)] = self.emb_char[word]
+        segms = doc['segments']
+        segm_len = torch.tensor([len(s) for s in segms])
 
         # genre-id
-        genre_id = torch.as_tensor([self.genres[doc['doc_key'][:2]]])
+        genre_id = torch.as_tensor([self.genres.get(doc['doc_key'][:2], 0)])
 
         # speaker-ids
         speakers = list(itertools.chain.from_iterable(doc['speakers']))
-        speaker_dict = {s: i for i, s in enumerate(set(speakers))}
-        speaker_ids = torch.as_tensor([speaker_dict[s] for s in speakers])
+        speaker_dict = {'UNK': 0, '[SPL]': 1}
+        for s in speakers:
+            if s not in speaker_dict and len(speaker_dict) < 20:
+                speaker_dict[s] = len(speaker_dict)
+        if len(speaker_dict) == 20:
+            print(f'Speaker limit reached: {doc["doc_key"]}')
+        speaker_ids = torch.as_tensor([speaker_dict.get(s, 3) for s in speakers])
 
         # read cluster and mentions
         clusters = doc['clusters']
@@ -82,27 +74,21 @@ class Dataset(data.Dataset):
                 cluster_ids[gold_mention_map[tuple(mention)]] = cluster_id + 1
 
         # cand-starts / cand-ends
-        cand_starts, cand_ends = self.create_candidates(sent_len)
-
-        # elmo embedding
-        doc_key = doc['doc_key'].replace('/', ':')
-        elmo_cache_group = self.elmo_cache[doc_key]
-        sentences = [elmo_cache_group[str(i)][...] for i in range(offset, offset + sent_num)]
-        elmo_emb = torch.zeros([sent_num, max_sent_len, self.config['elmo_size'], 3])
-        for i, s in enumerate(sentences):
-            elmo_emb[i, :s.shape[0], :, :] = torch.as_tensor(s)
+        sent_map = doc['sent_map']
+        token_map = doc['token_map']
+        cand_starts, cand_ends = self.create_candidates(sent_map, token_map, segm_len)
 
         # return all necessary information for training and evaluation
-        return cont_emb, head_emb, elmo_emb, char_index, sent_len, genre_id, speaker_ids, gold_starts, gold_ends, cluster_ids, cand_starts, cand_ends
+        return segms, segm_len, genre_id, speaker_ids, gold_starts, gold_ends, cluster_ids, cand_starts, cand_ends
 
-    def truncate(self, doc, max_sent_num):
-        sents = doc['sentences']
-        sent_num = len(sents)
+    def truncate(self, doc, max_segm_num):
+        sents = doc['segments']
+        segm_num = len(sents)
         sent_len = [len(s) for s in sents]
 
         # calculated borders for truncation
-        sentence_start = random.randint(0, sent_num - max_sent_num)
-        sentence_end = sentence_start + max_sent_num
+        sentence_start = random.randint(0, segm_num - max_segm_num)
+        sentence_end = sentence_start + max_segm_num
         word_start = sum(sent_len[:sentence_start])
         word_end = sum(sent_len[:sentence_end])
 
@@ -117,16 +103,22 @@ class Dataset(data.Dataset):
 
         # truncated document with only the necessary information
         trun_doc = {
-            'sentences': sents[sentence_start:sentence_end],
-            'clusters': clusters,
+            'doc_key': doc['doc_key'],
+            'segments': sents[sentence_start:sentence_end],
+            'sent_map': doc['sent_map'][word_start:word_end],
+            'token_map': doc['token_map'][word_start:word_end],
             'speakers': doc['speakers'][sentence_start:sentence_end],
-            'doc_key': doc['doc_key']
+            'clusters': clusters
         }
 
         # return truncated doc and offset
         return trun_doc, sentence_start
 
-    def create_candidates(self, sent_len):
+    def create_candidates(self, sent_map, token_map, segm_len):
+        # calculate sentence lengths
+        sent_idx = range(sent_map[-1] + 1)
+        sent_len = [len([s for s in sent_map if s == sent]) for sent in sent_idx]
+
         # calculate all possible mentions
         max_ment_width = self.config['max_ment_width']
         cand_starts, cand_ends = [], []
@@ -139,9 +131,31 @@ class Dataset(data.Dataset):
                 cand_ends.extend(range(start, start+width))
             offset += s
 
-        # return candidate boundaries as tensors
+        # candidate boundaries as tensors
         cand_starts = torch.as_tensor(cand_starts)
         cand_ends = torch.as_tensor(cand_ends)
+
+        # set -1 for CLS and SEP token
+        token_map[0] = -1
+        token_map[-1] = -1
+        for sl in np.cumsum(segm_len[:-1]):
+            token_map[sl-1:sl+1] = [-1, -1]
+        tkn_map = torch.tensor(token_map)
+
+        # create tensor with possible starts
+        tkn_map_sh = torch.tensor([-1] + token_map[:-1])
+        start_ = tkn_map != tkn_map_sh
+        start_ &= tkn_map >= 0
+        # create tensor with possible ends
+        tkn_map_sh = torch.tensor(token_map[1:] + [-1])
+        end_ = tkn_map != tkn_map_sh
+        end_ &= tkn_map >= 0
+
+        # apply subtoken rules
+        filter = start_[cand_starts] & end_[cand_ends]
+        cand_starts = cand_starts[filter]
+        cand_ends = cand_ends[filter]
+
         return cand_starts, cand_ends
 
 
